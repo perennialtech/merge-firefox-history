@@ -1,13 +1,13 @@
 #!/bin/sh
 
-# merge-firefox-history.sh <db1> <db2> [backup_location]
+# merge-firefox-history.sh <db1> <db2> [backup_location] [-s|--skip-vacuum]
 #
 # Description:
 #   This script merges Firefox history databases (places.sqlite) by combining the moz_places and
 #   moz_historyvisits tables from two databases into a single database.
 #
 # Usage:
-#   merge-firefox-history.sh <db1> <db2> [backup_location]
+#   merge-firefox-history.sh <db1> <db2> [backup_location] [-s|--skip-vacuum]
 #
 # Arguments:
 #   <db1>: Path to the first Firefox history database file.
@@ -15,6 +15,7 @@
 #   [backup_location]: (Optional) Path to the directory where the backup of the first database
 #                      will be stored. If not provided, the backup will be created in the
 #                      current directory.
+#   [-s|--skip-vacuum]: (Optional) Skip vacuuming the databases before merging.
 #
 # Returns:
 #   0 on success, 1 on error.
@@ -133,16 +134,26 @@ EOF
 }
 
 # Check for the correct number of arguments
-if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
-  echo "Usage: $0 <db1> <db2> [backup_location]"
+if [ "$#" -lt 2 ] || [ "$#" -gt 4 ]; then
+  echo "Usage: $0 <db1> <db2> [backup_location] [-s|--skip-vacuum]"
   exit 1
 fi
 
 # Parse the backup location argument if provided
 backup_location="."
-if [ "$#" -eq 3 ]; then
-  backup_location="$3"
-fi
+skip_vacuum=0
+for arg in "$@"; do
+  case "$arg" in
+    -s|--skip-vacuum)
+      skip_vacuum=1
+      ;;
+    *)
+      if [ "$arg" != "$1" ] && [ "$arg" != "$2" ]; then
+        backup_location="$arg"
+      fi
+      ;;
+  esac
+done
 
 # Ensure both arguments are files that exist
 if [ ! -f "$1" ] || [ ! -f "$2" ]; then
@@ -186,18 +197,22 @@ if ! integrity_check "$2"; then
   exit 1
 fi
 
-# Vacuum the databases before merging
-log "Vacuuming databases before merging..."
-if ! vacuum_database "$1"; then
-  log "Vacuuming failed for database '$1'. Aborting merge."
-  exit 1
-fi
+# Vacuum the databases before merging (if not skipped)
+if [ $skip_vacuum -eq 0 ]; then
+  log "Vacuuming databases before merging..."
+  if ! vacuum_database "$1"; then
+    log "Vacuuming failed for database '$1'. Aborting merge."
+    exit 1
+  fi
 
-if ! vacuum_database "$2"; then
-  log "Vacuuming failed for database '$2'. Aborting merge."
-  exit 1
+  if ! vacuum_database "$2"; then
+    log "Vacuuming failed for database '$2'. Aborting merge."
+    exit 1
+  fi
+  log "Vacuuming completed for both databases."
+else
+  log "Skipping database vacuuming."
 fi
-log "Vacuuming completed for both databases."
 
 # Create a backup of the first database
 backup_file="$backup_dir/$(basename "$1").backup_$(date +%Y%m%d_%H%M%S)"
