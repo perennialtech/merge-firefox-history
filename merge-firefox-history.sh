@@ -236,6 +236,9 @@ if [ $? -ne 0 ]; then
 fi
 log "Created backup of $1 at $backup_file"
 
+# Record the start time
+start_time=$(date +%s)
+
 # Start transaction to ensure atomicity
 (
   perform_merge "$1" "$2"
@@ -245,4 +248,14 @@ log "Created backup of $1 at $backup_file"
   exit 1
 }
 
+# Record the end time
+end_time=$(date +%s)
+
+# Calculate the execution time
+execution_time=$((end_time - start_time))
+
+# Format the execution time
+formatted_time=$(printf '%02dh:%02dm:%02ds\n' $((execution_time/3600)) $((execution_time%3600/60)) $((execution_time%60)))
+
 log "Merge script execution completed."
+log "Execution time: $formatted_time"
