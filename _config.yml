@@ -1,0 +1,5 @@
+remote_theme: pages-themes/slate@v0.2.0
+title: merge-firefox-history
+description: Script designed to merge the browsing history from two Firefox profile databases.
+plugins:
+- jekyll-remote-theme
