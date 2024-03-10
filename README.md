@@ -2,7 +2,7 @@
 
 ## Description
 
-This script merges Firefox history databases by combining the `moz_places` and `moz_historyvisits` tables from two databases into a single database. It allows you to consolidate your browsing history from multiple Firefox profiles or instances.
+This script merges Firefox history databases ([`places.sqlite`](https://support.mozilla.org/en-US/kb/profiles-where-firefox-stores-user-data)) by combining the `moz_places` and `moz_historyvisits` tables from two databases into a single database. It allows you to consolidate your browsing history from multiple Firefox profiles or instances.
 
 ## Prerequisites
 
