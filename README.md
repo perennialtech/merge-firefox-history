@@ -77,7 +77,6 @@ The script logs detailed information with timestamps in the `merge.log` file. He
 
 ## Future enhancements
 
-- Option to specify a custom backup directory.
 - Improved error handling and reporting.
 
 ## License

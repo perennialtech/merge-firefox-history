@@ -123,10 +123,16 @@ EOF
   log "Merge completed successfully."
 }
 
-# Check for exactly two arguments
-if [ "$#" -ne 2 ]; then
-  echo "Usage: $0 <db1> <db2>"
+# Check for the correct number of arguments
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+  echo "Usage: $0 <db1> <db2> [backup_location]"
   exit 1
+fi
+
+# Parse the backup location argument if provided
+backup_location="."
+if [ "$#" -eq 3 ]; then
+  backup_location="$3"
 fi
 
 # Ensure both arguments are files that exist
@@ -146,6 +152,14 @@ case "$confirm" in
     exit 0
     ;;
 esac
+
+# Ensure the backup directory exists
+if [ ! -d "$backup_location" ]; then
+  mkdir -p "$backup_location"
+  log "Created backup directory: $backup_location"
+else
+  log "Using existing backup directory: $backup_location"
+fi
 
 # Perform integrity checks on the input databases
 if ! integrity_check "$1"; then
@@ -172,7 +186,7 @@ fi
 log "Vacuuming completed for both databases."
 
 # Create a backup of the first database
-backup_file="$1.backup_$(date +%Y%m%d_%H%M%S)"
+backup_file="$backup_location/$(basename "$1").backup_$(date +%Y%m%d_%H%M%S)"
 cp "$1" "$backup_file"
 log "Created backup of $1 at $backup_file"
 
