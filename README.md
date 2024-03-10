@@ -11,7 +11,7 @@ This script merges Firefox history databases ([`places.sqlite`](https://support.
 ## Usage
 
 ```shell
-merge-firefox-history.sh <db1> <db2> [backup_location]
+merge-firefox-history.sh <db1> <db2> [backup_location] [-s|--skip-vacuum] [-h|--help]
 ```
 
 ### Arguments
@@ -19,6 +19,8 @@ merge-firefox-history.sh <db1> <db2> [backup_location]
 - `<db1>`: Path to the first Firefox history database file.
 - `<db2>`: Path to the second Firefox history database file.
 - `[backup_location]`: (Optional) Path to the directory where the backup of the first database will be stored. If not provided, the backup will be created in the current directory.
+- `[-s|--skip-vacuum]`: (Optional) Skip vacuuming the databases before merging.
+- `[-h|--help]`: (Optional) Display the help menu.
 
 ### Example
 

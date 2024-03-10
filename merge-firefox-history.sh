@@ -1,32 +1,35 @@
 #!/bin/sh
 
-# merge-firefox-history.sh <db1> <db2> [backup_location] [-s|--skip-vacuum]
-#
-# Description:
-#   This script merges Firefox history databases (places.sqlite) by combining the moz_places and
-#   moz_historyvisits tables from two databases into a single database.
-#
-# Usage:
-#   merge-firefox-history.sh <db1> <db2> [backup_location] [-s|--skip-vacuum]
-#
-# Arguments:
-#   <db1>: Path to the first Firefox history database file.
-#   <db2>: Path to the second Firefox history database file.
-#   [backup_location]: (Optional) Path to the directory where the backup of the first database
-#                      will be stored. If not provided, the backup will be created in the
-#                      current directory.
-#   [-s|--skip-vacuum]: (Optional) Skip vacuuming the databases before merging.
-#
-# Returns:
-#   0 on success, 1 on error.
-#
-# Notes:
-#   - The script creates a backup of the first database before merging.
-#   - The script assumes the Firefox history database schema and uses SQLite commands.
-#   - Detailed logs with timestamps are recorded in the "merge.log" file.
-#   - If the specified backup directory doesn't exist, the script will attempt to create it.
-#   - The backup file will be named "<db1>.backup_<timestamp>" and stored in the specified
-#     backup location or the current directory if no location is provided.
+# Function: Display help menu
+display_help() {
+  cat <<EOF
+Usage: $0 <db1> <db2> [backup_location] [-s|--skip-vacuum] [-h|--help]
+
+Description:
+  This script merges Firefox history databases (places.sqlite) by combining the moz_places and
+  moz_historyvisits tables from two databases into a single database.
+
+Arguments:
+  <db1>                Path to the first Firefox history database file.
+  <db2>                Path to the second Firefox history database file.
+  [backup_location]    (Optional) Path to the directory where the backup of the first database
+                       will be stored. If not provided, the backup will be created in the
+                       current directory.
+  [-s|--skip-vacuum]   (Optional) Skip vacuuming the databases before merging.
+  [-h|--help]          Display this help menu.
+
+Returns:
+  0 on success, 1 on error.
+
+Notes:
+  - The script creates a backup of the first database before merging.
+  - The script assumes the Firefox history database schema and uses SQLite commands.
+  - Detailed logs with timestamps are recorded in the "merge.log" file.
+  - If the specified backup directory doesn't exist, the script will attempt to create it.
+  - The backup file will be named "<db1>.backup_<timestamp>" and stored in the specified
+    backup location or the current directory if no location is provided.
+EOF
+}
 
 # Function: Log messages with timestamps
 log() {
@@ -133,9 +136,19 @@ EOF
   log "Merge completed successfully."
 }
 
+# Check for help flag
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      display_help
+      exit 0
+      ;;
+  esac
+done
+
 # Check for the correct number of arguments
 if [ "$#" -lt 2 ] || [ "$#" -gt 4 ]; then
-  echo "Usage: $0 <db1> <db2> [backup_location] [-s|--skip-vacuum]"
+  display_help
   exit 1
 fi
 
