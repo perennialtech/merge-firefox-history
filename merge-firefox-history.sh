@@ -1,17 +1,20 @@
 #!/bin/sh
 
-# merge-firefox-history.sh <db1> <db2>
+# merge-firefox-history.sh <db1> <db2> [backup_location]
 #
 # Description:
-#   This script merges Firefox history databases by combining the moz_places and
+#   This script merges Firefox history databases (places.sqlite) by combining the moz_places and
 #   moz_historyvisits tables from two databases into a single database.
 #
 # Usage:
-#   merge-firefox-history.sh <db1> <db2>
+#   merge-firefox-history.sh <db1> <db2> [backup_location]
 #
 # Arguments:
 #   <db1>: Path to the first Firefox history database file.
 #   <db2>: Path to the second Firefox history database file.
+#   [backup_location]: (Optional) Path to the directory where the backup of the first database
+#                      will be stored. If not provided, the backup will be created in the
+#                      current directory.
 #
 # Returns:
 #   0 on success, 1 on error.
@@ -20,6 +23,9 @@
 #   - The script creates a backup of the first database before merging.
 #   - The script assumes the Firefox history database schema and uses SQLite commands.
 #   - Detailed logs with timestamps are recorded in the "merge.log" file.
+#   - If the specified backup directory doesn't exist, the script will attempt to create it.
+#   - The backup file will be named "<db1>.backup_<timestamp>" and stored in the specified
+#     backup location or the current directory if no location is provided.
 
 # Function: Log messages with timestamps
 log() {
@@ -32,6 +38,7 @@ integrity_check() {
   local db_file="$1"
   local required_tables=("moz_places" "moz_historyvisits")
 
+  # Iterate over the required tables and check their existence and accessibility
   for table in "${required_tables[@]}"; do
     if ! sqlite3 "$db_file" "SELECT count(*) FROM $table LIMIT 1;" >/dev/null 2>&1; then
       log "Error: Table '$table' not found or accessible in the database '$db_file'."
@@ -46,6 +53,8 @@ integrity_check() {
 vacuum_database() {
   local db_file="$1"
   log "Vacuuming database '$db_file'..."
+
+  # Execute the VACUUM command on the specified database file
   sqlite3 "$db_file" "VACUUM;"
   if [ $? -ne 0 ]; then
     log "Error vacuuming the database '$db_file'."
@@ -59,33 +68,34 @@ perform_merge() {
   local db1="$1"
   local db2="$2"
 
-  # Calculate the offset to ensure unique IDs
+  # Calculate the offset to ensure unique IDs in the merged database
   offset=$(sqlite3 "$db1" "SELECT ifnull(max(id), 0) + 1 FROM moz_historyvisits;")
   if [ $? -ne 0 ]; then
     log "Error calculating offset from $db1"
     return 1
   fi
 
-  # Execute SQLite commands
-  sqlite3 "$db1" <<EOF
+  # Execute SQLite commands to merge the databases
+  if ! sqlite3 "$db1" <<EOF
 BEGIN TRANSACTION;
 
-ATTACH "$db2" AS db2;
+-- Attach the second database as 'db2'
+ATTACH '$db2' AS db2;
 
--- Insert or ignore to prevent conflicts with existing records
+-- Insert or ignore records from db2.moz_places into moz_places
 INSERT OR IGNORE INTO moz_places(url, title, visit_count, hidden, typed, frecency, last_visit_date)
 SELECT url, title, visit_count, hidden, typed, frecency, last_visit_date FROM db2.moz_places;
 
--- Create a view to prepare for history visits insertion
+-- Create a view (db2.v1) to join db2.moz_places and db2.moz_historyvisits
 CREATE VIEW IF NOT EXISTS db2.v1 AS
 SELECT db2.moz_places.url, db2.moz_historyvisits.id, db2.moz_historyvisits.from_visit, db2.moz_historyvisits.visit_date, db2.moz_historyvisits.visit_type
 FROM db2.moz_places
 INNER JOIN db2.moz_historyvisits ON db2.moz_places.id = db2.moz_historyvisits.place_id;
 
--- Temporary table for adjusted IDs and visit dates, without setting a primary key
+-- Create a temporary table (t1) to store adjusted IDs and visit dates
 CREATE TEMPORARY TABLE IF NOT EXISTS t1(place_id INTEGER, id INTEGER, from_visit INTEGER, visit_date INTEGER, visit_type INTEGER);
 
--- Insert into the temporary table, adjusting IDs and from_visit values
+-- Insert records from the view into the temporary table, adjusting IDs and from_visit values
 INSERT INTO t1(place_id, id, from_visit, visit_date, visit_type)
 SELECT moz_places.id, db2.v1.id + $offset,
 CASE WHEN db2.v1.from_visit = 0 THEN 0 ELSE db2.v1.from_visit + $offset END,
@@ -93,7 +103,7 @@ db2.v1.visit_date, db2.v1.visit_type
 FROM moz_places
 INNER JOIN db2.v1 ON moz_places.url = db2.v1.url;
 
--- Deduplicate history visits based on place_id and visit_date
+-- Insert distinct records from the temporary table into moz_historyvisits
 INSERT OR IGNORE INTO moz_historyvisits(place_id, id, from_visit, visit_date, visit_type, session)
 SELECT DISTINCT place_id, id, from_visit, visit_date, visit_type, 0
 FROM t1;
@@ -104,8 +114,7 @@ COMMIT;
 DROP VIEW IF EXISTS db2.v1;
 DROP TABLE IF EXISTS t1;
 EOF
-
-  if [ $? -ne 0 ]; then
+  then
     log "An error occurred during the merge process."
     return 1
   fi
@@ -154,11 +163,16 @@ case "$confirm" in
 esac
 
 # Ensure the backup directory exists
-if [ ! -d "$backup_location" ]; then
-  mkdir -p "$backup_location"
-  log "Created backup directory: $backup_location"
+backup_dir=$(printf %q "$backup_location")
+if [ ! -d "$backup_dir" ]; then
+  mkdir -p "$backup_dir"
+  if [ $? -ne 0 ]; then
+    log "Failed to create backup directory: $backup_dir"
+    exit 1
+  fi
+  log "Created backup directory: $backup_dir"
 else
-  log "Using existing backup directory: $backup_location"
+  log "Using existing backup directory: $backup_dir"
 fi
 
 # Perform integrity checks on the input databases
@@ -186,8 +200,12 @@ fi
 log "Vacuuming completed for both databases."
 
 # Create a backup of the first database
-backup_file="$backup_location/$(basename "$1").backup_$(date +%Y%m%d_%H%M%S)"
+backup_file="$backup_dir/$(basename "$1").backup_$(date +%Y%m%d_%H%M%S)"
 cp "$1" "$backup_file"
+if [ $? -ne 0 ]; then
+  log "Failed to create backup of $1 at $backup_file. Aborting merge."
+  exit 1
+fi
 log "Created backup of $1 at $backup_file"
 
 # Start transaction to ensure atomicity
