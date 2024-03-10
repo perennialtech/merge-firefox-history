@@ -58,7 +58,7 @@ The script will prompt for user confirmation before proceeding with the merge. E
 
 - Merging large databases may take a considerable amount of time. Ensure sufficient disk space and system resources are available.
 
-## Log File
+## Log file
 
 The script logs detailed information with timestamps in the `merge.log` file. Here's an example of the log file content:
 
@@ -83,3 +83,4 @@ The script logs detailed information with timestamps in the `merge.log` file. He
 ## License
 
 This script is released under the [ISC License](https://www.isc.org/licenses/).
+
