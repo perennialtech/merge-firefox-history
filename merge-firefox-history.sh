@@ -78,30 +78,30 @@ SELECT url, title, visit_count, hidden, typed, frecency, last_visit_date FROM db
 
 -- Create a view to prepare for history visits insertion
 CREATE VIEW IF NOT EXISTS db2.v1 AS
-SELECT db2.moz_places.url, db2.moz_historyvisits.id, db2.moz_historyvisits.from_visit, db2.moz_historyvisits.visit_date
+SELECT db2.moz_places.url, db2.moz_historyvisits.id, db2.moz_historyvisits.from_visit, db2.moz_historyvisits.visit_date, db2.moz_historyvisits.visit_type
 FROM db2.moz_places
 INNER JOIN db2.moz_historyvisits ON db2.moz_places.id = db2.moz_historyvisits.place_id;
 
--- Temporary table for adjusted IDs and visit dates, without setting a primary key  
-CREATE TEMPORARY TABLE IF NOT EXISTS t1(place_id INTEGER, url LONGVARCHAR, id INTEGER, from_visit INTEGER, visit_date INTEGER);
+-- Temporary table for adjusted IDs and visit dates, without setting a primary key
+CREATE TEMPORARY TABLE IF NOT EXISTS t1(place_id INTEGER, id INTEGER, from_visit INTEGER, visit_date INTEGER, visit_type INTEGER);
 
 -- Insert into the temporary table, adjusting IDs and from_visit values
-INSERT INTO t1(place_id, id, from_visit, visit_date)  
+INSERT INTO t1(place_id, id, from_visit, visit_date, visit_type)
 SELECT moz_places.id, db2.v1.id + $offset,
-CASE WHEN db2.v1.from_visit = 0 THEN 0 ELSE db2.v1.from_visit + $offset END,  
-db2.v1.visit_date
+CASE WHEN db2.v1.from_visit = 0 THEN 0 ELSE db2.v1.from_visit + $offset END,
+db2.v1.visit_date, db2.v1.visit_type
 FROM moz_places
 INNER JOIN db2.v1 ON moz_places.url = db2.v1.url;
 
 -- Deduplicate history visits based on place_id and visit_date
 INSERT OR IGNORE INTO moz_historyvisits(place_id, id, from_visit, visit_date, visit_type, session)
-SELECT DISTINCT place_id, id, from_visit, visit_date, 2, 0  
+SELECT DISTINCT place_id, id, from_visit, visit_date, visit_type, 0
 FROM t1;
 
 COMMIT;
 
 -- Clean up: drop the view and temporary table
-DROP VIEW IF EXISTS db2.v1;  
+DROP VIEW IF EXISTS db2.v1;
 DROP TABLE IF EXISTS t1;
 EOF
 
@@ -160,14 +160,14 @@ fi
 
 # Vacuum the databases before merging
 log "Vacuuming databases before merging..."
-if ! vacuum_database "$1"; then  
+if ! vacuum_database "$1"; then
   log "Vacuuming failed for database '$1'. Aborting merge."
   exit 1
 fi
 
 if ! vacuum_database "$2"; then
   log "Vacuuming failed for database '$2'. Aborting merge."
-  exit 1  
+  exit 1
 fi
 log "Vacuuming completed for both databases."
 
@@ -178,7 +178,7 @@ log "Created backup of $1 at $backup_file"
 
 # Start transaction to ensure atomicity
 (
-  perform_merge "$1" "$2"  
+  perform_merge "$1" "$2"
 ) || {
   log "An error occurred. Rolling back transaction."
   sqlite3 "$1" "ROLLBACK;"
