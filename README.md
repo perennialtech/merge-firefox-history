@@ -45,7 +45,7 @@ backup of `profile1/places.sqlite` to the current directory.
 | `-n, --dry-run`        | Do the merge on a temporary copy and discard it.                               |
 | `-s, --skip-vacuum`    | Do not `VACUUM` the database (faster on large profiles).                       |
 | `-y, --yes`            | Do not ask for confirmation.                                                   |
-| `-f, --force`          | Allow overwriting `--output`, or merging into a database that is in use.       |
+| `-f, --force`          | Overwrite an existing `--output` file.                                         |
 | `--keep-temp`          | Keep the temporary working directory (for debugging).                          |
 | `-h, --help`           | Show help.                                                                     |
 
@@ -84,18 +84,36 @@ Firefox stores profiles in:
 
 ## Safety
 
-Before anything is changed, the target database is copied to a timestamped
-backup that includes any `-wal` file, and all database changes then run in a
-single transaction. If the merge fails, the backup is restored automatically
-and the incomplete transaction is rolled back.
+Both inputs are snapshotted with SQLite's online backup API before use, so the
+snapshot includes committed WAL contents. The source is opened read-only and is
+never modified. There is no unsafe file-copy fallback: if a snapshot cannot be
+taken, the run fails.
 
-The script refuses to modify a database that another process, usually Firefox,
-has open, and it refuses `--output` paths that point at either input database.
-The source database is only ever read, from a temporary snapshot, and the
-merged database is verified with `PRAGMA quick_check` and
-`PRAGMA foreign_key_check` before success is reported. Keep in mind that only
-one profile can use a given `places.sqlite` at a time, so close Firefox before
-swapping files.
+Before anything is changed, the target database is written to a timestamped
+backup. If the merge, a `VACUUM`, or the final verification fails, the backup is
+restored automatically. The generated merge statements share one transaction;
+the optional URL-hash update and `VACUUM` run afterwards and are covered by the
+same restore-on-failure path.
+
+Filling `url_hash` is best-effort. If `python3` is unavailable, or hashing
+fails, the merge still succeeds with a warning and Firefox calculates the
+missing hashes during idle maintenance. Use `--skip-vacuum` when compaction is
+not wanted or cannot be completed.
+
+A database that another process, usually Firefox, has open is never modified in
+place. `--output` and `--dry-run` work from a consistent snapshot instead. The
+script also refuses `--output` paths that refer to either input database, even
+through a hard link. An output file is written only after the merged database
+has passed `PRAGMA quick_check` and the foreign-key check; a failed run leaves
+an existing output file untouched.
+
+`PRAGMA foreign_key_check` is compared with the target's pre-merge baseline.
+Only violations introduced by the merge are fatal; pre-existing ones are
+reported but do not block the merge. Foreign-key checks cannot validate Places
+relationships that a particular schema does not declare as constraints.
+
+Keep in mind that only one profile can use a given `places.sqlite` at a time, so
+close Firefox before swapping files.
 
 ## Output
 
@@ -107,14 +125,14 @@ directory. Set the `MERGE_LOG` environment variable to use another file.
 [2026-10-20 23:04:03] Backup created: ./places.sqlite.backup_20261020_230403
 [2026-10-20 23:04:07] Merge completed successfully.
 [2026-10-20 23:04:07] Places added: 101628 (now 203148)
-[2026-10-20 23:04:07] Visits added: 215507 (now 442654; already present/duplicate: 0)
+[2026-10-20 23:04:07] Visits added: 215507 (now 442654; skipped as duplicate or unmapped: 0)
 ```
 
 ## Troubleshooting
 
 - **“database is open in another process”** – close Firefox (or the other
-  program using the file). Use `--output`/`--dry-run` to work from a copy
-  without closing anything.
+  program using the file) before an in-place merge. Use `--output`/`--dry-run`
+  to work from a consistent snapshot without closing anything.
 - **“database is locked”** – another process still has a write lock. Close
   Firefox and try again.
 - **Integrity check failed** – the database is damaged. Do not merge it. Make

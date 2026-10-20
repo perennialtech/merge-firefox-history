@@ -5,7 +5,8 @@
   "license": "ISC",
   "scripts": {
     "format": "shfmt -w . && prettier --write .",
-    "format:check": "shfmt -d . && prettier --check ."
+    "format:check": "shfmt -d . && prettier --check .",
+    "test": "python3 -m unittest discover -s tests -v"
   },
   "devDependencies": {
     "prettier": "3.9.10"

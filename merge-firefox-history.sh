@@ -6,9 +6,13 @@
 #
 # The script discovers the actual schema of both databases at runtime, so it
 # works with the current Places schema (Firefox 157 and newer) as well as with
-# much older profiles.  Nothing in the source database (db2) is modified, and
-# the target database is fully backed up before it is touched unless --dry-run
-# or --output is used.
+# older profiles that still contain the core Places tables.  Nothing in the
+# source database (db2) is modified, and the target database is fully backed up
+# before it is touched unless --dry-run or --output is used.
+#
+# Both the source snapshot and the target backup are taken through SQLite's
+# online backup API, which understands WAL contents and gives a consistent
+# database image even while another process has the file open.
 #
 # Tested with Firefox 157.  Places schema version at the time of writing: 87.
 
@@ -19,10 +23,13 @@ LOG_FILE=${MERGE_LOG:-merge.log}
 BACKUP_STAMP=$(date +%Y%m%d_%H%M%S)
 TMP_DIR=""
 KEEP_TMP=0
+COMPLETED=0
 RESTORE_ON_FAILURE=0
 BACKUP_FILE=""
 TARGET_DB=""
 IN_PLACE=0
+OUTPUT_MODE=0
+OUTPUT_PATH=""
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -46,6 +53,23 @@ die() {
 cleanup() {
   local status=$?
   trap - EXIT
+  # Do not let a second interrupt abort a restore or temporary-file cleanup.
+  trap '' INT TERM HUP
+
+  # Every unsuccessful exit after the backup was created restores the target,
+  # no matter which step failed.  Output files are only written after the
+  # result has been verified, so an interrupted run leaves the requested
+  # output path untouched.
+  if [ "$status" -ne 0 ] && [ "$COMPLETED" -ne 1 ]; then
+    if [ "$RESTORE_ON_FAILURE" -eq 1 ]; then
+      if restore_backup; then
+        log "The original database was restored from the backup."
+      else
+        log "ERROR: automatic restore failed. Backup: $BACKUP_FILE"
+      fi
+    fi
+  fi
+
   if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
     if [ "$KEEP_TMP" -eq 1 ]; then
       log "Temporary files kept in: $TMP_DIR"
@@ -57,7 +81,7 @@ cleanup() {
 }
 
 trap cleanup EXIT
-trap 'exit 130' INT TERM
+trap 'exit 130' INT TERM HUP
 
 # ---------------------------------------------------------------------------
 # Usage
@@ -87,23 +111,26 @@ Options:
                         Useful to check what would happen.
   -s, --skip-vacuum     Do not VACUUM the target database.
   -y, --yes             Do not ask for confirmation.
-  -f, --force           Proceed even if the target database appears to be in
-                        use, or if --output already exists.
+  -f, --force           Overwrite an existing --output file.
       --keep-temp       Keep the temporary working directory.
   -h, --help            Show this help.
 
 Notes:
   * Close Firefox before merging into a database it uses.  The script refuses
     to modify a database that a running process (for example Firefox) has
-    open, unless --force is given.
-  * A timestamped backup of <db1> (including any -wal file) is created before
-    the merge.  If the merge fails, the backup is restored.
-  * Existing places are matched by URL; visits are deduplicated by
-    (place, visit_date).  GUIDs are preserved when possible.
+    open.  Use --output or --dry-run to work from a snapshot instead.
+  * A consistent timestamped backup of <db1> is created with SQLite's online
+    backup API before the merge.  If the merge or final verification fails, the
+    backup is restored automatically.
+  * Existing places are matched by URL.  Visits are deduplicated by
+    (place, visit_date), including duplicates within the source database.
+    GUIDs are preserved when possible.
   * The merged database keeps the schema version of <db1>.  Open Firefox
-    afterwards and it will recalculate frecency.  url_hash is copied from
-    <db2>; for very old source profiles it is computed when python3 is
-    available, otherwise Firefox fills it in during idle maintenance.
+    afterwards and it will recalculate frecency.  On schemas without the
+    recalc_frecency columns, frecency is set to the older schema's -1
+    "recalculate" marker.  url_hash is copied from <db2>; for very old source
+    profiles it is computed when python3 is available, otherwise Firefox fills
+    it in during idle maintenance.
   * Favicons live in favicons.sqlite, not in places.sqlite, and are not merged.
   * Log output is appended to "merge.log" (override with MERGE_LOG).
 
@@ -201,36 +228,68 @@ db_in_use() {
   return 1
 }
 
-copy_db_files() {
-  # copy_db_files SRC DST  (main file plus -wal, if present)
+uri_escape_path() {
+  # Escape the characters that would otherwise terminate or alter a SQLite
+  # file URI.  The path is passed to SQLite, not to a shell.
+  local path=$1
+  path=${path//%/%25}
+  path=${path//\?/%3F}
+  path=${path//#/%23}
+  printf '%s' "$path"
+}
+
+snapshot_mode() {
+  # snapshot_mode FROM TO
   #
-  # The -shm file is intentionally not copied: it is a rebuildable cache and a
-  # stale copy can confuse SQLite.  Copying db + wal is enough to restore a
-  # consistent snapshot.
-  local src=$1 dst=$2 dir tmp_backup
-  rm -f -- "$dst" "$dst-wal" "$dst-shm"
-
-  # If another process (Firefox) has the database open, a plain file copy can
-  # catch a page mid-write.  SQLite's online backup API produces a consistent
-  # snapshot in that case.
-  if db_in_use "$src"; then
-    dir=$(dirname -- "$dst")
-    tmp_backup="$dir/.merge-firefox-history.tmpbackup.$$"
-    rm -f -- "$tmp_backup"
-    if (cd -- "$dir" &&
-      sqlite3 -cmd ".timeout 10000" "$src" ".backup '$(basename -- "$tmp_backup")'") &&
-      [ -s "$tmp_backup" ]; then
-      mv -f -- "$tmp_backup" "$dst" || return 1
-      return 0
+  # sqlite3 creates its backup file with the process umask.  Keep an existing
+  # destination's mode when replacing it and use a private mode for new files,
+  # since Places databases contain browsing history.
+  local from=$1 to=$2 mode
+  if [ -e "$from" ]; then
+    mode=$(stat -c '%a' "$from" 2>/dev/null) ||
+      mode=$(stat -f '%Lp' "$from" 2>/dev/null) || mode=""
+    if [ -n "$mode" ]; then
+      chmod "$mode" "$to" 2>/dev/null && return 0
     fi
-    rm -f -- "$tmp_backup"
-    warn "Online backup of '$src' failed; falling back to a file copy."
+  fi
+  chmod 600 "$to" 2>/dev/null || true
+}
+
+sqlite_backup() {
+  # sqlite_backup SRC DST
+  #
+  # Take a consistent snapshot with SQLite's online backup API.  The source is
+  # opened read-only, so this works for databases that another process has
+  # open and never checkpoints or otherwise writes to the source.  There is no
+  # file-copy fallback: an incomplete or failed snapshot must fail the run.
+  local src=$1 dst=$2 dir tmp src_uri
+  dir=$(dirname -- "$dst")
+  [ -d "$dir" ] || return 1
+  [ ! -d "$dst" ] || return 1
+
+  src_uri="file:$(uri_escape_path "$(resolve_path "$src")")?mode=ro"
+  tmp=".merge-firefox-history.backup.$$.$RANDOM"
+  rm -f -- "$dir/$tmp" "$dir/$tmp-wal" "$dir/$tmp-shm"
+
+  if ! (cd -- "$dir" &&
+    sqlite3 -batch -cmd ".timeout 60000" "$src_uri" ".backup '$tmp'"); then
+    rm -f -- "$dir/$tmp" "$dir/$tmp-wal" "$dir/$tmp-shm"
+    return 1
   fi
 
-  cp -- "$src" "$dst" || return 1
-  if [ -f "$src-wal" ]; then
-    cp -- "$src-wal" "$dst-wal" || return 1
+  if [ ! -s "$dir/$tmp" ]; then
+    rm -f -- "$dir/$tmp" "$dir/$tmp-wal" "$dir/$tmp-shm"
+    return 1
   fi
+
+  snapshot_mode "$dst" "$dir/$tmp"
+  rm -f -- "$dst-wal" "$dst-shm"
+  # The temporary file is in the destination directory, so this rename replaces
+  # an existing file atomically.
+  mv -f -- "$dir/$tmp" "$dst" || {
+    rm -f -- "$dir/$tmp" "$dir/$tmp-wal" "$dir/$tmp-shm"
+    return 1
+  }
   return 0
 }
 
@@ -244,14 +303,28 @@ db_quick_check() {
   return 0
 }
 
+capture_foreign_key_check() {
+  # capture_foreign_key_check DB OUTPUT
+  local db=$1 output=$2
+  sqlite3 -batch "$db" "PRAGMA foreign_key_check;" >"$output" 2>&1
+}
+
+new_foreign_key_violations() {
+  # new_foreign_key_violations BEFORE AFTER
+  #
+  # Both inputs contain one 'PRAGMA foreign_key_check' row per violation.  Print
+  # only the violations that did not exist before the merge, so a database with
+  # pre-existing damage can still be merged without hiding new damage.
+  local before=$1 after=$2
+  sort -u "$before" >"${before}.sorted" || return 1
+  sort -u "$after" >"${after}.sorted" || return 1
+  comm -13 "${before}.sorted" "${after}.sorted"
+}
+
 restore_backup() {
   [ -n "$BACKUP_FILE" ] && [ -f "$BACKUP_FILE" ] || return 1
   log "Restoring '${TARGET_DB}' from backup..."
-  rm -f -- "${TARGET_DB}-wal" "${TARGET_DB}-shm"
-  cp -- "$BACKUP_FILE" "$TARGET_DB" || return 1
-  if [ -f "${BACKUP_FILE}-wal" ]; then
-    cp -- "${BACKUP_FILE}-wal" "${TARGET_DB}-wal" || return 1
-  fi
+  sqlite_backup "$BACKUP_FILE" "$TARGET_DB" || return 1
   log "Restored '${TARGET_DB}'."
 }
 
@@ -260,7 +333,8 @@ restore_backup() {
 # hash; Firefox itself fills them in during its (at most daily) idle
 # maintenance.  When python3 is available we can do it right away instead.
 # The algorithm mirrors PlacesHashString()/HashURL() in
-# toolkit/components/places/Helpers.cpp; it is verified against real databases.
+# toolkit/components/places/Helpers.cpp; the tests contain fixed reference
+# vectors for the cases most likely to regress.
 fill_missing_url_hash() {
   local db=$1 missing
   local -a cols
@@ -332,7 +406,8 @@ build_merge_sql() {
   local -a dst_places src_places dst_visits src_visits
   local -a places_cols places_vals visit_cols visit_vals
   local col
-  local origins_ok=0 origins_recalc=0 have_guid_src=0 have_guid_dst=0
+  local origins_ok=0 origins_recalc=0 origins_old_frecency=0
+  local have_guid_src=0 have_guid_dst=0
   local have_visit_session=0 have_visit_source=0
   local -a dst_origins src_origins
 
@@ -418,7 +493,8 @@ SELECT
 FROM src.moz_places s
 WHERE s.url IS NOT NULL
   AND s.url <> ''
-  AND NOT EXISTS (SELECT 1 FROM dst_url d WHERE d.url = s.url);"
+  AND NOT EXISTS (SELECT 1 FROM dst_url d WHERE d.url = s.url)
+  AND s.id = (SELECT MIN(s2.id) FROM src.moz_places s2 WHERE s2.url = s.url);"
 
   # ---------------------------------------------------------------- SQL file
   {
@@ -452,14 +528,15 @@ SQL
       printf -- '-- Merge origins\n'
       printf 'INSERT OR IGNORE INTO main.moz_origins (%s)\nSELECT %s FROM src.moz_origins s;\n\n' \
         "$(join_by ', ' "${origin_cols[@]}")" "$(join_by ', ' "${origin_vals[@]}")"
-      # Track origin recalc flags for the places that will be touched.
+      # Track how origins must be invalidated for the places that are touched.
       if has_col recalc_frecency "${dst_origins[@]}"; then
         origins_recalc=1
-      else
-        origins_recalc=0
+      elif has_col frecency "${dst_origins[@]}"; then
+        origins_old_frecency=1
       fi
     else
       origins_recalc=0
+      origins_old_frecency=0
     fi
 
     # URL index snapshot ----------------------------------------------------
@@ -489,21 +566,57 @@ CREATE INDEX place_map_dst ON place_map(dst_id);
 SQL
 
     # Visits ----------------------------------------------------------------
+    #
+    # Duplicates are collapsed by (destination place, visit_date).  The lowest
+    # source visit id is retained so the choice is deterministic, and every
+    # other source id for that pair is mapped onto the retained visit.  This
+    # keeps from_visit references meaningful even when they point at a
+    # duplicate that was not inserted.
     printf -- '-- Select visits that are not already present\n'
     cat <<SQL
-CREATE TEMP TABLE visit_map(src_id INTEGER PRIMARY KEY, dst_id INTEGER, place_id INTEGER, visit_date INTEGER);
-INSERT INTO visit_map(src_id, dst_id, place_id, visit_date)
-SELECT v.id,
-       v.id + $offset,
-       pm.dst_id,
-       v.visit_date
-FROM src.moz_historyvisits v
-JOIN place_map pm ON pm.src_id = v.place_id
+CREATE TEMP TABLE visit_canon(
+  place_id INTEGER NOT NULL,
+  visit_date INTEGER NOT NULL,
+  src_id INTEGER NOT NULL,
+  dst_id INTEGER NOT NULL,
+  PRIMARY KEY (place_id, visit_date)
+);
+INSERT INTO visit_canon(place_id, visit_date, src_id, dst_id)
+SELECT place_id, visit_date, src_id, src_id + $offset
+FROM (
+  SELECT pm.dst_id AS place_id,
+         v.visit_date AS visit_date,
+         MIN(v.id) AS src_id
+  FROM src.moz_historyvisits v
+  JOIN place_map pm ON pm.src_id = v.place_id
+  GROUP BY pm.dst_id, v.visit_date
+) AS c
 WHERE NOT EXISTS (
   SELECT 1 FROM main.moz_historyvisits d
-  WHERE d.place_id = pm.dst_id AND d.visit_date = v.visit_date
+  WHERE d.place_id = c.place_id AND d.visit_date = c.visit_date
 );
-CREATE INDEX visit_map_dst ON visit_map(place_id, visit_date);
+
+CREATE TEMP TABLE visit_map(
+  src_id INTEGER PRIMARY KEY,
+  dst_id INTEGER NOT NULL,
+  place_id INTEGER NOT NULL,
+  visit_date INTEGER NOT NULL,
+  insert_row INTEGER NOT NULL
+);
+INSERT INTO visit_map(src_id, dst_id, place_id, visit_date, insert_row)
+SELECT v.id,
+       COALESCE(vc.dst_id,
+                (SELECT MIN(d.id) FROM main.moz_historyvisits d
+                  WHERE d.place_id = pm.dst_id
+                    AND d.visit_date = v.visit_date)),
+       pm.dst_id,
+       v.visit_date,
+       CASE WHEN vc.src_id = v.id THEN 1 ELSE 0 END
+FROM src.moz_historyvisits v
+JOIN place_map pm ON pm.src_id = v.place_id
+LEFT JOIN visit_canon vc
+  ON vc.place_id = pm.dst_id AND vc.visit_date = v.visit_date;
+CREATE INDEX visit_map_dst ON visit_map(dst_id);
 
 SQL
 
@@ -518,11 +631,6 @@ CASE
   WHEN v.from_visit IS NULL OR v.from_visit = 0 THEN 0
   ELSE COALESCE(
     (SELECT vm2.dst_id FROM visit_map vm2 WHERE vm2.src_id = v.from_visit),
-    (SELECT d.id
-       FROM main.moz_historyvisits d
-       JOIN src.moz_historyvisits sv ON sv.id = v.from_visit
-       JOIN place_map pm2 ON pm2.src_id = sv.place_id
-      WHERE d.place_id = pm2.dst_id AND d.visit_date = sv.visit_date),
     0)
 END
 SQL
@@ -542,7 +650,7 @@ SQL
       visit_vals+=('(SELECT pm3.dst_id FROM place_map pm3 WHERE pm3.src_id = v.triggeringPlaceId)')
     fi
 
-    printf -- '-- Insert visits\nINSERT INTO main.moz_historyvisits (%s)\nSELECT\n  %s\nFROM visit_map vm\nJOIN src.moz_historyvisits v ON v.id = vm.src_id;\n\n' \
+    printf -- '-- Insert visits\nINSERT INTO main.moz_historyvisits (%s)\nSELECT\n  %s\nFROM visit_map vm\nJOIN src.moz_historyvisits v ON v.id = vm.src_id\nWHERE vm.insert_row = 1;\n\n' \
       "$(join_by ', ' "${visit_cols[@]}")" "$(join_by ",
   " "${visit_vals[@]}")"
 
@@ -558,8 +666,15 @@ UPDATE main.moz_places SET
                       WHERE v.place_id = main.moz_places.id)
 SQL
     )
-    has_col recalc_frecency "${dst_places[@]}" && places_update+=',
+    if has_col recalc_frecency "${dst_places[@]}"; then
+      places_update+=',
   recalc_frecency = 1'
+    elif has_col frecency "${dst_places[@]}"; then
+      # Schemas older than Places 70 use a negative frecency as the request to
+      # recalculate it; -1 is the "no value yet" sentinel.
+      places_update+=',
+  frecency = -1'
+    fi
     has_col recalc_alt_frecency "${dst_places[@]}" && places_update+=',
   recalc_alt_frecency = 1'
     if has_col foreign_count "${dst_places[@]}" && table_exists "$target" moz_bookmarks && table_exists "$target" moz_keywords; then
@@ -582,6 +697,14 @@ WHERE id IN (SELECT origin_id FROM main.moz_places
               WHERE id IN (SELECT dst_id FROM place_map) AND origin_id IS NOT NULL);
 SQL
       fi
+      printf '\n'
+    elif [ "$origins_old_frecency" -eq 1 ]; then
+      cat <<'SQL'
+-- Older schemas use a negative origin frecency to request recalculation.
+UPDATE main.moz_origins SET frecency = -1
+WHERE id IN (SELECT origin_id FROM main.moz_places
+              WHERE id IN (SELECT dst_id FROM place_map) AND origin_id IS NOT NULL);
+SQL
       printf '\n'
     fi
 
@@ -647,6 +770,7 @@ SQL
 db1=""
 db2=""
 backup_location="."
+backup_dir_set=0
 output=""
 skip_vacuum=0
 assume_yes=0
@@ -663,9 +787,13 @@ while [ $# -gt 0 ]; do
     -b | --backup-dir)
       [ $# -ge 2 ] || die "Option '$1' requires an argument."
       backup_location=$2
+      backup_dir_set=1
       shift
       ;;
-    --backup-dir=*) backup_location=${1#*=} ;;
+    --backup-dir=*)
+      backup_location=${1#*=}
+      backup_dir_set=1
+      ;;
     -o | --output)
       [ $# -ge 2 ] || die "Option '$1' requires an argument."
       output=$2
@@ -703,8 +831,11 @@ fi
 db1=${positionals[0]}
 db2=${positionals[1]}
 if [ "${#positionals[@]}" -eq 3 ]; then
-  [ "$backup_location" = "." ] || warn "Backup directory given twice; using '$backup_location'."
-  backup_location=${positionals[2]}
+  if [ "$backup_dir_set" -eq 1 ]; then
+    warn "Backup directory given twice; using '$backup_location' (from --backup-dir)."
+  else
+    backup_location=${positionals[2]}
+  fi
 fi
 
 if [ "$dry_run" -eq 1 ] && [ -n "$output" ]; then
@@ -731,7 +862,7 @@ version_ge "$sqlite_version" "3.24.0" ||
 db1=$(resolve_path "$db1") || die "Cannot resolve '$db1'."
 db2=$(resolve_path "$db2") || die "Cannot resolve '$db2'."
 
-[ "$db1" = "$db2" ] && die "The two databases are the same file."
+[ "$db1" -ef "$db2" ] && die "The two databases are the same file (possibly through a hard link)."
 
 is_sqlite_file "$db1" || die "'$db1' is not a SQLite database."
 is_sqlite_file "$db2" || die "'$db2' is not a SQLite database."
@@ -739,27 +870,30 @@ is_sqlite_file "$db2" || die "'$db2' is not a SQLite database."
 if [ -z "$output" ] && [ "$dry_run" -eq 0 ]; then
   IN_PLACE=1
   if db_in_use "$db1"; then
-    if [ "$force" -eq 1 ]; then
-      warn "'$db1' is open in another process; continuing because --force was given."
-    else
-      die "'$db1' is open in another process (probably Firefox). Close Firefox first, or use --output/--dry-run."
-    fi
+    die "'$db1' is open in another process (probably Firefox). Close Firefox first, or use --output/--dry-run."
   fi
   [ -e "${db1}-wal" ] && warn "'${db1}-wal' exists. Make sure Firefox was shut down cleanly."
 else
   if db_in_use "$db1"; then
-    warn "'$db1' is open in another process. The working copy may miss recent changes; close Firefox for a reliable copy."
+    warn "'$db1' is open in another process. The snapshot is consistent but may not include changes made after it was taken."
   fi
 fi
 
 if db_in_use "$db2"; then
-  warn "'$db2' is open in another process. The snapshot may miss recent changes; close Firefox for a reliable copy."
+  warn "'$db2' is open in another process. The snapshot is consistent but may not include changes made after it was taken."
 fi
 
 if [ -n "$output" ] && [ "$dry_run" -eq 0 ]; then
+  OUTPUT_MODE=1
   output_resolved=$(resolve_path "$output")
-  [ "$output_resolved" = "$db1" ] && die "--output must not be the same file as <db1>; omit --output to merge in place."
-  [ "$output_resolved" = "$db2" ] && die "--output must not be the same file as <db2>; the source database is never modified."
+  [ -d "$output_resolved" ] && die "Output path '$output' is a directory."
+  if [ -e "$output_resolved" ]; then
+    [ "$output_resolved" -ef "$db1" ] && die "--output must not be the same file as <db1>; omit --output to merge in place."
+    [ "$output_resolved" -ef "$db2" ] && die "--output must not be the same file as <db2>; the source database is never modified."
+  else
+    [ "$output_resolved" = "$db1" ] && die "--output must not be the same file as <db1>; omit --output to merge in place."
+    [ "$output_resolved" = "$db2" ] && die "--output must not be the same file as <db2>; the source database is never modified."
+  fi
   [ -e "$output_resolved" ] && [ "$force" -eq 0 ] && die "Output file '$output' already exists (use --force to overwrite)."
 fi
 
@@ -794,8 +928,9 @@ TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/merge-firefox-history.XXXXXX") ||
   die "Could not create a temporary directory."
 SOURCE_SNAPSHOT="$TMP_DIR/source.sqlite"
 
-copy_db_files "$db2" "$SOURCE_SNAPSHOT" ||
-  die "Could not copy the source database to '$SOURCE_SNAPSHOT'."
+# The source is only ever read, and always from a consistent online snapshot.
+sqlite_backup "$db2" "$SOURCE_SNAPSHOT" ||
+  die "Could not take a consistent snapshot of '$db2'."
 
 db_quick_check "$SOURCE_SNAPSHOT" ||
   die "The source database failed its integrity check. Copy it to a safe place and check it with 'sqlite3 \"$db2\" \"PRAGMA integrity_check;\"'."
@@ -812,18 +947,20 @@ if [ "$IN_PLACE" -eq 1 ]; then
     done
     BACKUP_FILE="${BACKUP_FILE}_${backup_suffix}"
   fi
-  copy_db_files "$db1" "$BACKUP_FILE" || die "Could not create a backup of '$db1'."
+  sqlite_backup "$db1" "$BACKUP_FILE" || die "Could not create a backup of '$db1'."
   RESTORE_ON_FAILURE=1
   log "Backup created: $BACKUP_FILE"
-  # Opening the target may checkpoint a stale WAL; the backup above is taken
-  # before that happens.
-elif [ -n "$output" ]; then
-  TARGET_DB=$(resolve_path "$output") || die "Cannot resolve '$output'."
-  copy_db_files "$db1" "$TARGET_DB" || die "Could not create '$TARGET_DB'."
-  log "Created working copy: $TARGET_DB"
+elif [ "$OUTPUT_MODE" -eq 1 ]; then
+  # Work on a temporary copy.  The requested output path is only written after
+  # the merge has been verified, so a failure never leaves a partial output or
+  # damages a previously existing file.
+  TARGET_DB="$TMP_DIR/target.sqlite"
+  sqlite_backup "$db1" "$TARGET_DB" || die "Could not create a working copy of '$db1'."
+  OUTPUT_PATH=$output_resolved
+  log "Created working copy for '$OUTPUT_PATH'."
 else
   TARGET_DB="$TMP_DIR/target.sqlite"
-  copy_db_files "$db1" "$TARGET_DB" || die "Could not create a working copy of '$db1'."
+  sqlite_backup "$db1" "$TARGET_DB" || die "Could not create a working copy of '$db1'."
 fi
 
 # ---------------------------------------------------------------------------
@@ -850,8 +987,14 @@ if ! table_exists "$TARGET_DB" moz_places_extra || ! table_exists "$SOURCE_SNAPS
   log "Note: this Places schema has no 'moz_places_extra' table (older Firefox)."
 fi
 
+# Baseline foreign-key state.  Only violations introduced by this merge are
+# fatal; damage that already existed in the target is reported but preserved.
+FK_BEFORE="$TMP_DIR/foreign_keys.before"
+capture_foreign_key_check "$TARGET_DB" "$FK_BEFORE" ||
+  die "Could not run 'PRAGMA foreign_key_check' on '$TARGET_DB'."
+
 # ---------------------------------------------------------------------------
-# Vacuum and merge
+# Merge
 # ---------------------------------------------------------------------------
 
 vacuum_db() {
@@ -861,15 +1004,12 @@ vacuum_db() {
   log "Vacuum completed for '$db'."
 }
 
-if [ "$skip_vacuum" -eq 0 ]; then
-  vacuum_db "$TARGET_DB" || die "Vacuuming '$TARGET_DB' failed."
-else
-  log "Skipping vacuum."
-fi
-
-places_before=$(sqlite3 "$TARGET_DB" "SELECT COUNT(*) FROM moz_places;")
-visits_before=$(sqlite3 "$TARGET_DB" "SELECT COUNT(*) FROM moz_historyvisits;")
-source_visits=$(sqlite3 "$SOURCE_SNAPSHOT" "SELECT COUNT(*) FROM moz_historyvisits;")
+places_before=$(sqlite3 "$TARGET_DB" "SELECT COUNT(*) FROM moz_places;") ||
+  die "Could not read the target place count."
+visits_before=$(sqlite3 "$TARGET_DB" "SELECT COUNT(*) FROM moz_historyvisits;") ||
+  die "Could not read the target visit count."
+source_visits=$(sqlite3 "$SOURCE_SNAPSHOT" "SELECT COUNT(*) FROM moz_historyvisits;") ||
+  die "Could not read the source visit count."
 
 MERGE_SQL="$TMP_DIR/merge.sql"
 build_merge_sql "$TARGET_DB" "$SOURCE_SNAPSHOT" "$MERGE_SQL" ||
@@ -878,21 +1018,18 @@ build_merge_sql "$TARGET_DB" "$SOURCE_SNAPSHOT" "$MERGE_SQL" ||
 start_time=$(date +%s)
 
 if ! sqlite3 -batch "$TARGET_DB" <"$MERGE_SQL"; then
-  log "The merge failed."
-  if [ "$RESTORE_ON_FAILURE" -eq 1 ]; then
-    if restore_backup; then
-      log "The original database was restored from the backup."
-    else
-      log "ERROR: automatic restore failed. Backup: $BACKUP_FILE"
-    fi
-  elif [ -n "$output" ] && [ "$dry_run" -eq 0 ]; then
-    rm -f -- "$TARGET_DB" "${TARGET_DB}-wal" "${TARGET_DB}-shm"
-    log "Removed incomplete output file '$TARGET_DB'."
-  fi
-  exit 1
+  die "The merge failed. The target will be restored from the backup."
 fi
 
+# URL hashes and VACUUM run outside the merge transaction; any failure from
+# here on is still handled by the single cleanup path.
 fill_missing_url_hash "$TARGET_DB" || warn "Could not fill in missing url_hash values."
+
+if [ "$skip_vacuum" -eq 0 ]; then
+  vacuum_db "$TARGET_DB" || die "Vacuuming '$TARGET_DB' failed."
+else
+  log "Skipping vacuum."
+fi
 
 end_time=$(date +%s)
 execution_time=$((end_time - start_time))
@@ -901,50 +1038,62 @@ execution_time=$((end_time - start_time))
 # Verification and summary
 # ---------------------------------------------------------------------------
 
-if ! db_quick_check "$TARGET_DB"; then
-  log "ERROR: the merged database failed 'PRAGMA quick_check'."
-  if [ "$RESTORE_ON_FAILURE" -eq 1 ]; then
-    if restore_backup; then
-      log "The original database was restored from the backup."
-    else
-      log "ERROR: automatic restore failed. Backup: $BACKUP_FILE"
-    fi
-  fi
-  exit 1
-fi
-
-if [ "$skip_vacuum" -eq 0 ]; then
-  vacuum_db "$TARGET_DB" || warn "Final vacuum failed; the merge itself succeeded."
-fi
-
-# Make sure the result is self-contained: merge WAL contents into the main file
-# so that copying the single .sqlite file cannot lose data.
+# Make the result self-contained where possible.  The verification below still
+# reads any remaining WAL content, and --output snapshots the whole database.
 sqlite3 "$TARGET_DB" "PRAGMA optimize; PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true
 if [ -s "${TARGET_DB}-wal" ]; then
   warn "'${TARGET_DB}-wal' is not empty. If you copy the merged database elsewhere, copy this file too (or run 'PRAGMA wal_checkpoint(TRUNCATE);' on it first)."
 fi
 
-places_after=$(sqlite3 "$TARGET_DB" "SELECT COUNT(*) FROM moz_places;")
-visits_after=$(sqlite3 "$TARGET_DB" "SELECT COUNT(*) FROM moz_historyvisits;")
+if ! db_quick_check "$TARGET_DB"; then
+  die "The merged database failed 'PRAGMA quick_check'."
+fi
+
+FK_AFTER="$TMP_DIR/foreign_keys.after"
+capture_foreign_key_check "$TARGET_DB" "$FK_AFTER" ||
+  die "Could not run 'PRAGMA foreign_key_check' on the merged database."
+fk_new=$(new_foreign_key_violations "$FK_BEFORE" "$FK_AFTER") ||
+  die "Could not compare foreign key check results."
+new_fk_problems=$(printf '%s\n' "$fk_new" | sed '/^$/d' | wc -l | tr -d '[:space:]')
+if [ "${new_fk_problems:-0}" -gt 0 ]; then
+  printf '%s\n' "$fk_new" | while IFS= read -r row; do
+    [ -n "$row" ] && log "New foreign key violation: $row"
+  done
+  die "The merge introduced $new_fk_problems foreign key violation(s)."
+fi
+
+fk_existing=$(sed '/^$/d' "$FK_BEFORE" | wc -l | tr -d '[:space:]')
+if [ "${fk_existing:-0}" -gt 0 ]; then
+  warn "$fk_existing pre-existing foreign key violation(s) remain in the target; no new violations were introduced."
+fi
+
+places_after=$(sqlite3 "$TARGET_DB" "SELECT COUNT(*) FROM moz_places;") ||
+  die "Could not read the merged place count."
+visits_after=$(sqlite3 "$TARGET_DB" "SELECT COUNT(*) FROM moz_historyvisits;") ||
+  die "Could not read the merged visit count."
 places_added=$((places_after - places_before))
 visits_added=$((visits_after - visits_before))
 visits_skipped=$((source_visits - visits_added))
 [ "$visits_skipped" -lt 0 ] && visits_skipped=0
 
-fk_problems=$(sqlite3 "$TARGET_DB" "PRAGMA foreign_key_check;" 2>/dev/null | wc -l | tr -d '[:space:]')
-if [ "${fk_problems:-0}" -gt 0 ]; then
-  warn "PRAGMA foreign_key_check reported $fk_problems foreign key violation(s) (this can also be pre-existing)."
+if [ "$OUTPUT_MODE" -eq 1 ]; then
+  sqlite_backup "$TARGET_DB" "$OUTPUT_PATH" ||
+    die "Could not write the verified result to '$OUTPUT_PATH'."
 fi
+
+# From this point on the operation is complete: do not restore the target or
+# remove an output file in the exit handler.
+COMPLETED=1
 
 log "Merge completed successfully."
 log "Places added: $places_added (now $places_after)"
-log "Visits added: $visits_added (now $visits_after; already present/duplicate: $visits_skipped)"
+log "Visits added: $visits_added (now $visits_after; skipped as duplicate or unmapped: $visits_skipped)"
 log "Execution time: $(printf '%02dh:%02dm:%02ds' $((execution_time / 3600)) $((execution_time % 3600 / 60)) $((execution_time % 60)))"
 
 if [ "$dry_run" -eq 1 ]; then
   log "Dry run: no changes were made to '$db1'."
-elif [ -n "$output" ]; then
-  log "Result written to '$TARGET_DB'."
+elif [ "$OUTPUT_MODE" -eq 1 ]; then
+  log "Result written to '$OUTPUT_PATH'."
 else
   log "Target database updated: '$TARGET_DB'."
   log "Open Firefox once and let it idle so it can recalculate frecency."

@@ -42,3 +42,11 @@ jobs:
 
       - name: Check shell syntax
         run: bash -n merge-firefox-history.sh
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 psmisc lsof
+
+      - name: Run integration tests
+        run: python3 -m unittest discover -s tests -v
