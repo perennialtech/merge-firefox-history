@@ -2,49 +2,16 @@
 
 Merge the browsing history of two Firefox profiles by combining their
 [`places.sqlite`](https://support.mozilla.org/en-US/kb/profiles-where-firefox-stores-user-data)
-databases.
-
-The script is designed for **Firefox 157 and newer** (Places schema version 87)
-and also works with older profiles. The schema of both databases is discovered
-at runtime, so version differences between two profiles are handled gracefully.
-
-## What gets merged
-
-- `moz_places` (URLs, titles, visit counts, frecency, GUIDs, origins)
-- `moz_historyvisits` (individual visits, including redirects and visit types)
-- `moz_origins`
-- `moz_inputhistory` (address bar history, highest use count wins)
-- `moz_places_metadata` (view time, key presses, scrolling, …) when present
-
-Matching and deduplication:
-
-- Places are matched by URL. Existing target rows are never duplicated.
-- Visits are deduplicated by `(place, visit_date)`.
-- GUIDs from the source are kept unless they are invalid or already in use, in
-  which case a new valid GUID is generated.
-- `visit_count`, `last_visit_date` and `foreign_count` are recalculated with
-  the same rules Firefox uses.
-- Frecency is marked for recalculation; Firefox refreshes it on idle.
-- If the source comes from an old profile without a `url_hash` column, the
-  hashes are calculated immediately when `python3` is available (otherwise
-  Firefox fills them in during its next idle maintenance).
-
-Not merged, on purpose:
-
-- **Favicons** – they live in `favicons.sqlite`, a separate database.
-- **Bookmarks, keywords and annotations** – this tool only merges history.
-- Sync metadata (`moz_places_extra`, `moz_historyvisits_extra`) and new-tab
-  interaction statistics – merging these between two Sync accounts/profiles
-  could cause duplicated uploads or misleading statistics.
+databases. The target profile keeps its own history and gains the history from
+the other profile; the source database is never modified. Current Firefox
+releases and older profiles are supported.
 
 ## Requirements
 
-- Bash 4.0 or newer (arrays and `mapfile` are used; macOS ships Bash 3.2,
-  install a newer one via Homebrew if needed).
-- SQLite 3.24.0 or newer (`sqlite3` in `PATH`).
-- Optional: `python3`, used to fill in `url_hash` for very old source
-  databases.
-- `fuser` or `lsof` (recommended) so the script can detect a running Firefox.
+- Bash 4.0 or newer (macOS ships Bash 3.2; install a newer one via Homebrew)
+- SQLite 3.24.0 or newer (`sqlite3` in `PATH`)
+- Optional: `python3`, to fill in URL hashes imported from very old profiles
+- Recommended: `fuser` or `lsof`, so the script can detect a running Firefox
 
 ## Usage
 
@@ -52,8 +19,22 @@ Not merged, on purpose:
 ./merge-firefox-history.sh <db1> <db2> [backup_location] [options]
 ```
 
-`<db1>` is the target database and receives the history from `<db2>`.
-**`<db2>` is never modified.**
+`<db1>` is the target database and receives the history from `<db2>`. **`<db2>`
+is never modified.**
+
+Close Firefox before using a database as the target. A timestamped backup of
+`<db1>` is created before anything is changed.
+
+### Example
+
+```shell
+./merge-firefox-history.sh \
+  ~/.mozilla/firefox/profile1.default-release/places.sqlite \
+  ~/.mozilla/firefox/profile2.default-release/places.sqlite
+```
+
+This adds the history from `profile2` to `profile1` and writes a timestamped
+backup of `profile1/places.sqlite` to the current directory.
 
 ### Options
 
@@ -68,21 +49,12 @@ Not merged, on purpose:
 | `--keep-temp`          | Keep the temporary working directory (for debugging).                          |
 | `-h, --help`           | Show help.                                                                     |
 
-The third positional argument is accepted as a backwards-compatible alias for
+The third positional argument is a backwards-compatible alias for
 `--backup-dir`.
 
-### Example
+### Merge into a new file
 
-```shell
-./merge-firefox-history.sh \
-  ~/.mozilla/firefox/profile1.default-release/places.sqlite \
-  ~/.mozilla/firefox/profile2.default-release/places.sqlite
-```
-
-This adds the history from `profile2` to `profile1`. A timestamped backup of
-`profile1/places.sqlite` is created in the current directory first.
-
-Safer variant that leaves both originals untouched:
+To leave both originals untouched, write the result to a separate file:
 
 ```shell
 ./merge-firefox-history.sh \
@@ -92,16 +64,17 @@ Safer variant that leaves both originals untouched:
 ```
 
 Then replace the profile's `places.sqlite` with the merged file while Firefox
-is closed (keeping a copy of the original).
+is closed, keeping a copy of the original.
 
-Use `--dry-run` first if you just want to see how many places and visits would
-be added.
+### Preview the result
+
+Use `--dry-run` to perform the merge on a temporary copy and report how many
+places and visits would be added.
 
 ## Where is places.sqlite?
 
 In Firefox, open `about:support` and use **Profile Directory → Open Directory**.
-The database is the file named `places.sqlite` in that directory. Close Firefox
-before using a database as the target.
+The database is the file named `places.sqlite` in that directory.
 
 Firefox stores profiles in:
 
@@ -113,20 +86,20 @@ Firefox stores profiles in:
 
 - The target database is copied to a timestamped backup (including any `-wal`
   file) before anything is changed.
-- Database changes run in a single SQLite transaction.
+- Database changes run in a single transaction.
 - If the merge fails, the backup is restored automatically and the incomplete
   transaction is rolled back.
-- The script refuses to modify a database that a running process (usually
+- The script refuses to modify a database that another process (usually
   Firefox) has open. It also refuses `--output` paths that point at either
   input database.
 - The merged database is verified with `PRAGMA quick_check` and
-  `PRAGMA foreign_key_check` before the script reports success.
-- The source database is only ever read (from a temporary snapshot).
+  `PRAGMA foreign_key_check` before success is reported.
+- The source database is only ever read, from a temporary snapshot.
 
 Only one profile can use a given `places.sqlite` at a time. Close Firefox
 before swapping files.
 
-## Log
+## Output
 
 Progress is written to stderr and appended to `merge.log` in the current
 directory. Set the `MERGE_LOG` environment variable to use another file.
@@ -134,12 +107,9 @@ directory. Set the `MERGE_LOG` environment variable to use another file.
 ```log
 [2026-10-20 23:04:03] merge-firefox-history: target='.../profile1/places.sqlite' source='.../profile2/places.sqlite'
 [2026-10-20 23:04:03] Backup created: ./places.sqlite.backup_20261020_230403
-[2026-10-20 23:04:03] Vacuuming '.../profile1/places.sqlite'...
-[2026-10-20 23:04:03] Vacuum completed for '.../profile1/places.sqlite'.
 [2026-10-20 23:04:07] Merge completed successfully.
 [2026-10-20 23:04:07] Places added: 101628 (now 203148)
 [2026-10-20 23:04:07] Visits added: 215507 (now 442654; already present/duplicate: 0)
-[2026-10-20 23:04:07] Execution time: 00h:00m:03s
 ```
 
 ## Troubleshooting
@@ -158,15 +128,22 @@ directory. Set the `MERGE_LOG` environment variable to use another file.
 - **Large profiles** – merging several hundred thousand visits takes a few
   seconds, but `VACUUM` can take longer. Use `--skip-vacuum` if needed.
 
-## Limitations
+## What is not merged
 
-- History is matched by URL only; metadata that exists in both profiles (for
-  example a title changed in one profile) is not reconciled.
-- Pages imported from profiles older than the `moz_origins` schema may have no
-  origin assigned. Firefox still displays them; only origin-based frecency is
-  affected.
-- Merging is not a Sync replacement: bookmarks, tabs, passwords, add-ons and
-  preferences are not touched.
+- **Favicons** – they live in `favicons.sqlite`, a separate database.
+- **Bookmarks, keywords, annotations, passwords, tabs, add-ons and
+  preferences** – this tool only merges history.
+- **Sync metadata** – merging it between two profiles could cause duplicated
+  uploads or misleading statistics.
+
+History is matched by URL, so metadata that exists in both profiles (for
+example a title changed in one profile) is not reconciled. Pages imported from
+profiles older than the `moz_origins` schema may have no origin assigned;
+Firefox still displays them, only origin-based frecency is affected.
+
+This is not a Sync replacement. See
+[How it works](docs/how-it-works.md) for the merged tables, deduplication
+rules, and schema compatibility details.
 
 ## License
 
