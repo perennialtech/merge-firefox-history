@@ -84,20 +84,18 @@ Firefox stores profiles in:
 
 ## Safety
 
-- The target database is copied to a timestamped backup (including any `-wal`
-  file) before anything is changed.
-- Database changes run in a single transaction.
-- If the merge fails, the backup is restored automatically and the incomplete
-  transaction is rolled back.
-- The script refuses to modify a database that another process (usually
-  Firefox) has open. It also refuses `--output` paths that point at either
-  input database.
-- The merged database is verified with `PRAGMA quick_check` and
-  `PRAGMA foreign_key_check` before success is reported.
-- The source database is only ever read, from a temporary snapshot.
+Before anything is changed, the target database is copied to a timestamped
+backup that includes any `-wal` file, and all database changes then run in a
+single transaction. If the merge fails, the backup is restored automatically
+and the incomplete transaction is rolled back.
 
-Only one profile can use a given `places.sqlite` at a time. Close Firefox
-before swapping files.
+The script refuses to modify a database that another process, usually Firefox,
+has open, and it refuses `--output` paths that point at either input database.
+The source database is only ever read, from a temporary snapshot, and the
+merged database is verified with `PRAGMA quick_check` and
+`PRAGMA foreign_key_check` before success is reported. Keep in mind that only
+one profile can use a given `places.sqlite` at a time, so close Firefox before
+swapping files.
 
 ## Output
 
@@ -130,11 +128,11 @@ directory. Set the `MERGE_LOG` environment variable to use another file.
 
 ## What is not merged
 
-- **Favicons** – they live in `favicons.sqlite`, a separate database.
-- **Bookmarks, keywords, annotations, passwords, tabs, add-ons and
-  preferences** – this tool only merges history.
-- **Sync metadata** – merging it between two profiles could cause duplicated
-  uploads or misleading statistics.
+Favicons live in `favicons.sqlite`, a separate database, and bookmarks,
+keywords, annotations, passwords, tabs, add-ons and preferences are all outside
+the scope of a history merge. Sync metadata is also left alone, because merging
+it between two profiles could cause duplicated uploads or misleading
+statistics.
 
 History is matched by URL, so metadata that exists in both profiles (for
 example a title changed in one profile) is not reconciled. Pages imported from

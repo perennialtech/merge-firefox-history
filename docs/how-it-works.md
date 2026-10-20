@@ -23,13 +23,12 @@ afterwards and it recalculates frecency.
 
 ## Matching and deduplication
 
-- Places are matched by URL. Existing target rows are never duplicated.
-- Visits are deduplicated by `(place, visit_date)`.
-- GUIDs from the source are kept unless they are invalid or already in use, in
-  which case a new valid GUID is generated.
-- `visit_count`, `last_visit_date` and `foreign_count` are recalculated with
-  the same rules Firefox uses.
-- Frecency is marked for recalculation; Firefox refreshes it on idle.
+Places are matched by URL, and existing target rows are never duplicated, while
+visits are deduplicated by `(place, visit_date)`. GUIDs from the source are kept
+unless they are invalid or already in use, in which case a new valid GUID is
+generated. The `visit_count`, `last_visit_date` and `foreign_count` counters are
+recalculated with the same rules Firefox uses, and frecency is marked for
+recalculation so that Firefox refreshes it on idle.
 
 ## URL hashes
 
@@ -44,8 +43,8 @@ against real databases.
 
 ## Not merged, on purpose
 
-- **Favicons** – they live in `favicons.sqlite`, a separate database.
-- **Bookmarks, keywords and annotations** – this tool only merges history.
-- **Sync metadata** (`moz_places_extra`, `moz_historyvisits_extra`) and
-  new-tab interaction statistics – merging these between two Sync
-  accounts/profiles could cause duplicated uploads or misleading statistics.
+Favicons live in `favicons.sqlite`, a separate database, and bookmarks,
+keywords and annotations fall outside a history merge. Sync metadata
+(`moz_places_extra`, `moz_historyvisits_extra`) and new-tab interaction
+statistics are also left out, because merging them between two Sync
+accounts/profiles could cause duplicated uploads or misleading statistics.
