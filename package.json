@@ -1,0 +1,13 @@
+{
+  "name": "merge-firefox-history",
+  "private": true,
+  "description": "Merge the browsing history of two Firefox profiles",
+  "license": "ISC",
+  "scripts": {
+    "format": "shfmt -w . && prettier --write .",
+    "format:check": "shfmt -d . && prettier --check ."
+  },
+  "devDependencies": {
+    "prettier": "3.9.10"
+  }
+}

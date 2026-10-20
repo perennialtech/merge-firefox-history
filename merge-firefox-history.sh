@@ -38,7 +38,10 @@ log() {
 }
 
 warn() { log "Warning: $*"; }
-die() { log "Error: $*"; exit 1; }
+die() {
+  log "Error: $*"
+  exit 1
+}
 
 cleanup() {
   local status=$?
@@ -215,8 +218,8 @@ copy_db_files() {
     tmp_backup="$dir/.merge-firefox-history.tmpbackup.$$"
     rm -f -- "$tmp_backup"
     if (cd -- "$dir" &&
-        sqlite3 -cmd ".timeout 10000" "$src" ".backup '$(basename -- "$tmp_backup")'") &&
-       [ -s "$tmp_backup" ]; then
+      sqlite3 -cmd ".timeout 10000" "$src" ".backup '$(basename -- "$tmp_backup")'") &&
+      [ -s "$tmp_backup" ]; then
       mv -f -- "$tmp_backup" "$dst" || return 1
       return 0
     fi
@@ -234,7 +237,10 @@ copy_db_files() {
 db_quick_check() {
   local db=$1 result
   result=$(sqlite3 "$db" "PRAGMA quick_check;" 2>&1) || return 1
-  [ "$result" = "ok" ] || { printf '%s\n' "$result" >&2; return 1; }
+  [ "$result" = "ok" ] || {
+    printf '%s\n' "$result" >&2
+    return 1
+  }
   return 0
 }
 
@@ -342,7 +348,7 @@ build_merge_sql() {
     has_col "$col" "${dst_places[@]}" || continue
     case "$col" in
       # Handled explicitly below, or intentionally not copied.
-      id|guid|origin_id|favicon_id|foreign_count|recalc_frecency|recalc_alt_frecency) continue ;;
+      id | guid | origin_id | favicon_id | foreign_count | recalc_frecency | recalc_alt_frecency) continue ;;
     esac
     places_cols+=("\"$col\"")
     places_vals+=("s.\"$col\"")
@@ -354,7 +360,8 @@ build_merge_sql() {
   if [ "$have_guid_dst" -eq 1 ]; then
     places_cols+=('"guid"')
     if [ "$have_guid_src" -eq 1 ]; then
-      places_vals+=("$(cat <<'SQL'
+      places_vals+=("$(
+        cat <<'SQL'
 CASE
   WHEN s."guid" IS NOT NULL
    AND length(s."guid") = 12
@@ -364,22 +371,31 @@ CASE
   ELSE lower(hex(randomblob(6)))
 END
 SQL
-)")
+      )")
     else
       places_vals+=("lower(hex(randomblob(6)))")
     fi
   fi
 
   if table_exists "$target" moz_origins && table_exists "$source" moz_origins &&
-     has_col origin_id "${dst_places[@]}" && has_col origin_id "${src_places[@]}"; then
+    has_col origin_id "${dst_places[@]}" && has_col origin_id "${src_places[@]}"; then
     origins_ok=1
     places_cols+=('"origin_id"')
     places_vals+=('(SELECT o.id FROM main.moz_origins o JOIN src.moz_origins so ON so.id = s."origin_id" WHERE o.host = so.host AND o.prefix = so.prefix)')
   fi
 
-  has_col foreign_count "${dst_places[@]}" && { places_cols+=('"foreign_count"'); places_vals+=("0"); }
-  has_col recalc_frecency "${dst_places[@]}" && { places_cols+=('"recalc_frecency"'); places_vals+=("1"); }
-  has_col recalc_alt_frecency "${dst_places[@]}" && { places_cols+=('"recalc_alt_frecency"'); places_vals+=("1"); }
+  has_col foreign_count "${dst_places[@]}" && {
+    places_cols+=('"foreign_count"')
+    places_vals+=("0")
+  }
+  has_col recalc_frecency "${dst_places[@]}" && {
+    places_cols+=('"recalc_frecency"')
+    places_vals+=("1")
+  }
+  has_col recalc_alt_frecency "${dst_places[@]}" && {
+    places_cols+=('"recalc_alt_frecency"')
+    places_vals+=("1")
+  }
 
   # --- moz_historyvisits columns -------------------------------------------
   offset=$(sqlite3 "$target" "SELECT COALESCE(MAX(id), 0) FROM moz_historyvisits;") ||
@@ -496,7 +512,8 @@ SQL
     visit_vals=("vm.dst_id" "vm.place_id")
 
     local from_visit_expr
-    from_visit_expr=$(cat <<'SQL'
+    from_visit_expr=$(
+      cat <<'SQL'
 CASE
   WHEN v.from_visit IS NULL OR v.from_visit = 0 THEN 0
   ELSE COALESCE(
@@ -509,7 +526,7 @@ CASE
     0)
 END
 SQL
-)
+    )
     visit_vals+=("$from_visit_expr" "vm.visit_date" "v.visit_type")
 
     if [ "$have_visit_session" -eq 1 ]; then
@@ -531,7 +548,8 @@ SQL
 
     # Recalculate per-place counters ----------------------------------------
     local places_update
-    places_update=$(cat <<'SQL'
+    places_update=$(
+      cat <<'SQL'
 UPDATE main.moz_places SET
   visit_count = (SELECT COUNT(*) FROM main.moz_historyvisits v
                   WHERE v.place_id = main.moz_places.id
@@ -539,7 +557,7 @@ UPDATE main.moz_places SET
   last_visit_date = (SELECT MAX(v.visit_date) FROM main.moz_historyvisits v
                       WHERE v.place_id = main.moz_places.id)
 SQL
-)
+    )
     has_col recalc_frecency "${dst_places[@]}" && places_update+=',
   recalc_frecency = 1'
     has_col recalc_alt_frecency "${dst_places[@]}" && places_update+=',
@@ -584,12 +602,12 @@ SQL
 
     # Places metadata -------------------------------------------------------
     if table_exists "$target" moz_places_metadata && table_exists "$source" moz_places_metadata &&
-       table_exists "$target" moz_places_metadata_search_queries &&
-       table_exists "$source" moz_places_metadata_search_queries &&
-       [ "$(sqlite3 "$target" "SELECT count(*) FROM pragma_table_info('moz_places_metadata') WHERE name IN ('place_id','referrer_place_id','created_at','updated_at','total_view_time','typing_time','key_presses','scrolling_time','scrolling_distance','document_type','search_query_id');")" = "11" ] &&
-       [ "$(sqlite3 "$source" "SELECT count(*) FROM pragma_table_info('moz_places_metadata') WHERE name IN ('place_id','referrer_place_id','created_at','updated_at','total_view_time','typing_time','key_presses','scrolling_time','scrolling_distance','document_type','search_query_id');")" = "11" ] &&
-       [ "$(sqlite3 "$target" "SELECT count(*) FROM pragma_table_info('moz_places_metadata_search_queries') WHERE name = 'terms';")" = "1" ] &&
-       [ "$(sqlite3 "$source" "SELECT count(*) FROM pragma_table_info('moz_places_metadata_search_queries') WHERE name = 'terms';")" = "1" ]; then
+      table_exists "$target" moz_places_metadata_search_queries &&
+      table_exists "$source" moz_places_metadata_search_queries &&
+      [ "$(sqlite3 "$target" "SELECT count(*) FROM pragma_table_info('moz_places_metadata') WHERE name IN ('place_id','referrer_place_id','created_at','updated_at','total_view_time','typing_time','key_presses','scrolling_time','scrolling_distance','document_type','search_query_id');")" = "11" ] &&
+      [ "$(sqlite3 "$source" "SELECT count(*) FROM pragma_table_info('moz_places_metadata') WHERE name IN ('place_id','referrer_place_id','created_at','updated_at','total_view_time','typing_time','key_presses','scrolling_time','scrolling_distance','document_type','search_query_id');")" = "11" ] &&
+      [ "$(sqlite3 "$target" "SELECT count(*) FROM pragma_table_info('moz_places_metadata_search_queries') WHERE name = 'terms';")" = "1" ] &&
+      [ "$(sqlite3 "$source" "SELECT count(*) FROM pragma_table_info('moz_places_metadata_search_queries') WHERE name = 'terms';")" = "1" ]; then
       cat <<'SQL'
 -- Merge history metadata (view time, key presses, ...).
 INSERT OR IGNORE INTO main.moz_places_metadata_search_queries(terms)
@@ -638,30 +656,33 @@ positionals=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -h|--help)
+    -h | --help)
       usage
       exit 0
       ;;
-    -b|--backup-dir)
+    -b | --backup-dir)
       [ $# -ge 2 ] || die "Option '$1' requires an argument."
       backup_location=$2
       shift
       ;;
     --backup-dir=*) backup_location=${1#*=} ;;
-    -o|--output)
+    -o | --output)
       [ $# -ge 2 ] || die "Option '$1' requires an argument."
       output=$2
       shift
       ;;
     --output=*) output=${1#*=} ;;
-    -n|--dry-run) dry_run=1 ;;
-    -s|--skip-vacuum) skip_vacuum=1 ;;
-    -y|--yes) assume_yes=1 ;;
-    -f|--force) force=1 ;;
+    -n | --dry-run) dry_run=1 ;;
+    -s | --skip-vacuum) skip_vacuum=1 ;;
+    -y | --yes) assume_yes=1 ;;
+    -f | --force) force=1 ;;
     --keep-temp) KEEP_TMP=1 ;;
     --)
       shift
-      while [ $# -gt 0 ]; do positionals+=("$1"); shift; done
+      while [ $# -gt 0 ]; do
+        positionals+=("$1")
+        shift
+      done
       break
       ;;
     -*)
@@ -757,8 +778,11 @@ if [ "$assume_yes" -eq 0 ]; then
   fi
   read -r -p "$prompt" answer || answer=""
   case "$answer" in
-    [yY]|[yY][eE][sS]) ;;
-    *) log "Merge aborted."; exit 0 ;;
+    [yY] | [yY][eE][sS]) ;;
+    *)
+      log "Merge aborted."
+      exit 0
+      ;;
   esac
 fi
 
@@ -915,7 +939,7 @@ fi
 log "Merge completed successfully."
 log "Places added: $places_added (now $places_after)"
 log "Visits added: $visits_added (now $visits_after; already present/duplicate: $visits_skipped)"
-log "Execution time: $(printf '%02dh:%02dm:%02ds' $((execution_time/3600)) $((execution_time%3600/60)) $((execution_time%60)))"
+log "Execution time: $(printf '%02dh:%02dm:%02ds' $((execution_time / 3600)) $((execution_time % 3600 / 60)) $((execution_time % 60)))"
 
 if [ "$dry_run" -eq 1 ]; then
   log "Dry run: no changes were made to '$db1'."

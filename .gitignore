@@ -1,3 +1,4 @@
 *.sqlite*
 *.log*
 *.diff
+node_modules/
