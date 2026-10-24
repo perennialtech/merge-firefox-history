@@ -35,7 +35,19 @@ older schemas, and URL-hash reference vectors.
 python3 -m unittest discover -s tests -v
 ```
 
+To test against genuine Firefox-created databases, install Firefox,
+[geckodriver](https://github.com/mozilla/geckodriver) and
+[Selenium](https://www.selenium.dev/documentation/webdriver/). Then run:
+
+```shell
+MFFH_REAL_FIREFOX=1 python3 -m unittest discover -s tests -p test_real_firefox.py -v
+```
+
+The test opens only local HTTP pages in two temporary Firefox profiles. It
+merges their actual `places.sqlite` databases, checks the results and repeat
+imports, then deletes both profiles. No personal browser data is used.
+
 ## Checks
 
-CI runs `pnpm run format:check`, `bash -n merge-firefox-history.sh`, and the
-test suite on every push and pull request.
+CI runs formatting, shell syntax, the synthetic integration tests and a
+separate real-Firefox integration test on every push and pull request.
