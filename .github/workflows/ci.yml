@@ -50,3 +50,30 @@ jobs:
 
       - name: Run integration tests
         run: python3 -m unittest discover -s tests -v
+
+  real-firefox:
+    name: Real Firefox history
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - uses: browser-actions/setup-firefox@v1
+        with:
+          firefox-version: latest
+
+      - uses: browser-actions/setup-geckodriver@v1
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 psmisc lsof
+          python -m pip install 'selenium==4.37.0'
+
+      - name: Merge real Firefox history
+        env:
+          MFFH_REAL_FIREFOX: "1"
+        run: python3 -m unittest discover -s tests -p test_real_firefox.py -v
